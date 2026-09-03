@@ -112,6 +112,9 @@ button.clear:hover{background:var(--accent-soft)}
   background:var(--surface);border:1px solid var(--line);border-radius:14px;
   overflow:hidden;box-shadow:var(--shadow);
 }
+.kpis.k7{grid-template-columns:repeat(7,1fr)}
+.kpis.k7 .kpi{padding:18px 15px}
+.kpis.k7 .k-value{font-size:23px}
 .kpi{padding:18px 20px;border-left:1px solid var(--line)}
 .kpi:first-child{border-left:none}
 .kpi .k-label{font-size:10.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);font-weight:700}
@@ -223,7 +226,7 @@ footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);font-si
 </div>
 
 <div class="wrap">
-  <div class="kpis" id="kpis"></div>
+  <div class="kpis k7" id="kpis"></div>
   <div id="avisos"></div>
 
   <section>
@@ -288,6 +291,23 @@ footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);font-si
   </section>
 
   <section>
+    <div class="sec-head"><h2>Valor da cliente (LTV)</h2><span class="hint" id="hint-ltv"></span></div>
+    <div class="kpis" id="kpis-ltv" style="margin-bottom:18px"></div>
+    <div class="grid g-2">
+      <div class="panel">
+        <h3>Quanto uma cliente acumula com o tempo</h3>
+        <p class="p-sub">Receita média já acumulada por cliente a cada mês depois da primeira visita, separada pelo ano em que a cliente chegou. Cada linha vai até onde 80% da turma já tem aquele tempo de casa — depois disso a média mudaria de população, não de valor.</p>
+        <div class="chart-box tall"><canvas id="ch-ltv"></canvas></div>
+      </div>
+      <div class="panel">
+        <h3>Clientes por faixa de gasto acumulado</h3>
+        <p class="p-sub">Quantas clientes há em cada faixa de LTV. O tooltip mostra quanto a faixa representa do faturamento.</p>
+        <div class="chart-box tall"><canvas id="ch-ltv-faixa"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <div class="sec-head"><h2>Detalhamento</h2><span class="hint">Clique no cabeçalho para reordenar</span></div>
     <div class="panel">
       <h3>Por procedimento</h3>
@@ -337,7 +357,7 @@ let TRAFEGO = [{"Mes": "2023-09", "Investimento": 803.67, "Impressoes": 165832, 
 // se o fetch da planilha for bloqueado (visualizador sem acesso à rede, offline), o painel
 // ainda abre com dados e avisa que está mostrando a cópia.
 const SNAPSHOT_CSV = ``;
-const SNAPSHOT_DATA = "02/09/2026";
+const SNAPSHOT_DATA = "03/09/2026";
 
 /* =========================================================================
    2. LEITURA E LIMPEZA DO CSV
@@ -424,6 +444,7 @@ const rotuloMes = k => MESES[+k.slice(5,7)-1] + "/" + k.slice(2,4);
 
 // Estado global
 let LINHAS = [], DESCARTADAS = 0, FONTE = "cópia", ATUALIZADO = null;
+let LTV = null;              // recalculado a cada carga da base (não depende dos filtros)
 let ROTULO_PROC = new Map(); // chave normalizada -> grafia exibida
 
 function processar(texto){
@@ -475,6 +496,7 @@ function processar(texto){
   }
   LINHAS = saida.sort((a,b) => a.data - b.data);
   DESCARTADAS = descartadas;
+  LTV = calcularLTV();
 }
 
 /* =========================================================================
@@ -582,6 +604,107 @@ function metricas(linhas){
     novosPct: comResposta ? novos/comResposta : NaN,
     retornoPct: clientes.size ? recorrentes/clientes.size : NaN,
     novos, recorrentes
+  };
+}
+
+/* =========================================================================
+   5b. LTV — o que cada cliente acumula ao longo da vida
+   Sempre sobre a base inteira: cortar o histórico de uma cliente pelo filtro
+   de período daria um "LTV" truncado, que é o erro clássico dessa métrica.
+   ========================================================================= */
+const DIA = 86400000;
+const HORIZONTE_LTV = 24;    // meses da curva de valor acumulado
+const MIN_COORTE = 50;       // ano de entrada com menos clientes que isso não vira curva
+const FAIXAS_LTV = [
+  {rot:"até R$ 100",       min:0,    max:100},
+  {rot:"R$ 100 a 300",     min:100,  max:300},
+  {rot:"R$ 300 a 600",     min:300,  max:600},
+  {rot:"R$ 600 a 1.200",   min:600,  max:1200},
+  {rot:"mais de R$ 1.200", min:1200, max:Infinity}
+];
+// Meses completos entre duas datas (o dia do mês conta: 15/01 -> 14/02 ainda é 0).
+const mesesEntre = (a,b) => (b.getFullYear()-a.getFullYear())*12 + (b.getMonth()-a.getMonth()) - (b.getDate() < a.getDate() ? 1 : 0);
+
+function calcularLTV(){
+  const hoje = new Date();
+  const cli = new Map();
+  for (const l of LINHAS){            // LINHAS já vem ordenado por data
+    if (!l.clienteKey) continue;
+    let c = cli.get(l.clienteKey);
+    if (!c){
+      // a origem é a declarada na primeira visita — é ela que diz quem trouxe a cliente
+      c = {nome:l.cliente, n:0, total:0, primeira:l.data, ultima:l.data, origem:l.origem, hist:[]};
+      cli.set(l.clienteKey, c);
+    }
+    c.n++; c.total += l.valor;
+    if (l.data > c.ultima) c.ultima = l.data;
+    c.hist.push({m: mesesEntre(c.primeira, l.data), d: (l.data - c.primeira)/DIA, v: l.valor});
+  }
+  const todos = [...cli.values()];
+  if (!todos.length) return null;
+
+  const soma = todos.reduce((s,c) => s+c.total, 0);
+  const rec = todos.filter(c => c.n >= 2);
+  const medio = soma/todos.length;
+  const medioRec = rec.length ? rec.reduce((s,c) => s+c.total, 0)/rec.length : NaN;
+  const vidaRec = rec.length ? rec.reduce((s,c) => s + (c.ultima-c.primeira)/DIA, 0)/rec.length/30.44 : NaN;
+
+  // LTV de 12 meses: só clientes que já completaram um ano de casa, e só o que gastaram nesse ano
+  const maduros = todos.filter(c => (hoje - c.primeira)/DIA >= 365);
+  const ltv12 = maduros.length
+    ? maduros.reduce((s,c) => s + c.hist.reduce((t,h) => t + (h.d <= 365 ? h.v : 0), 0), 0)/maduros.length
+    : NaN;
+
+  // Curva de valor acumulado, separada por ano de entrada da cliente.
+  // Uma curva só, misturando todo mundo, seria puxada para baixo pelas coortes antigas —
+  // o ticket do studio subiu muito de 2022 para cá, então o valor de uma cliente nova
+  // não se parece com o de uma cliente de 2022. Cada ano vira uma linha.
+  const porAno = new Map();
+  for (const c of todos){
+    const a = c.primeira.getFullYear();
+    if (!porAno.has(a)) porAno.set(a, []);
+    porAno.get(a).push(c);
+  }
+  const coortes = [];
+  for (const [ano, grupo] of [...porAno.entries()].sort((x,y) => x[0]-y[0])){
+    if (grupo.length < MIN_COORTE) continue;
+    const pontos = [];
+    for (let m=0; m<=HORIZONTE_LTV; m++){
+      const base = grupo.filter(c => mesesEntre(c.primeira, hoje) >= m);
+      // média acumulada não pode cair: se a base encolhe muito, o que muda é a população,
+      // não o valor da cliente. Só desenha enquanto 80% da turma já tem esse tempo de casa.
+      if (base.length < grupo.length*0.8) break;
+      pontos.push({
+        m, base: base.length,
+        media: base.reduce((s,c) => s + c.hist.reduce((t,h) => t + (h.m <= m ? h.v : 0), 0), 0)/base.length
+      });
+    }
+    if (pontos.length) coortes.push({ano, n: grupo.length, pontos, total: grupo.reduce((s,c) => s+c.total, 0)/grupo.length});
+  }
+
+  const faixas = FAIXAS_LTV.map(f => {
+    const dentro = todos.filter(c => c.total >= f.min && c.total < f.max);
+    return {rot:f.rot, n:dentro.length, fat:dentro.reduce((s,c) => s+c.total, 0)};
+  });
+
+  // --- retorno do anúncio pela vida inteira da cliente, não pelo mês da aquisição ---
+  // Só clientes conquistadas depois que o Meta Ads começou: antes disso não houve investimento.
+  const invTotal = TRAFEGO.reduce((s,t) => s + t.Investimento, 0);
+  const mesIni = TRAFEGO.length ? TRAFEGO.map(t => t.Mes).sort()[0] : null;
+  const iniAds = mesIni ? new Date(mesIni + "-01T00:00:00") : null;
+  const deAnuncio = iniAds ? todos.filter(c => ORIGENS_ANUNCIO.includes(c.origem) && c.primeira >= iniAds) : [];
+  const fatAnuncio = deAnuncio.reduce((s,c) => s+c.total, 0);
+
+  return {
+    clientes: todos.length, soma, medio, medioRec, recorrentes: rec.length, vidaRec,
+    ltv12, maduros: maduros.length, coortes, faixas,
+    inicio: todos.reduce((d,c) => c.primeira < d ? c.primeira : d, todos[0].primeira),
+    anuncio: {
+      mesIni, n: deAnuncio.length, fat: fatAnuncio, investimento: invTotal,
+      ltv: deAnuncio.length ? fatAnuncio/deAnuncio.length : NaN,
+      cac: deAnuncio.length ? invTotal/deAnuncio.length : NaN,
+      roas: invTotal ? fatAnuncio/invTotal : NaN
+    }
   };
 }
 
@@ -716,6 +839,51 @@ function desenharGraficos(dados, serie, trafegoMes){
         tooltip:{...opt.plugins.tooltip, callbacks:{ label: c => c.dataset.label + ": " + fmtR$.format(c.parsed.y) }}},
       scales:{...opt.scales, y:{...opt.scales.y, ticks:{...opt.scales.y.ticks, callback:v => fmtR$0.format(v)}}}}
   });
+
+  // 6.8 e 6.9 LTV — desenhados aqui porque destruir() acabou de limpar o registro
+  desenharGraficosLTV();
+}
+
+function desenharGraficosLTV(){
+  if (!LTV) return;
+  const s1 = cssVar("--s1"), surf = cssVar("--surface");
+  const opt = baseOpts();
+
+  // 6.8 Valor acumulado por tempo de casa, uma linha por ano de entrada
+  const coresCoorte = [cssVar("--ink-3"), cssVar("--s2"), cssVar("--s3"), cssVar("--s4"), cssVar("--s1")];
+  const maxM = Math.max(...LTV.coortes.map(c => c.pontos.length)) - 1;
+  const rotuloM = m => m === 0 ? "1ª visita" : m + (m === 1 ? " mês" : " meses");
+  graficos.ltv = new Chart(el("ch-ltv"), {
+    type:"line",
+    data:{ labels: Array.from({length:maxM+1}, (_,m) => rotuloM(m)),
+      datasets: LTV.coortes.map((co,i) => {
+        const cor = coresCoorte[(coresCoorte.length - LTV.coortes.length + i + coresCoorte.length) % coresCoorte.length];
+        return {
+          label: "Entraram em " + co.ano,
+          data: Array.from({length:maxM+1}, (_,m) => co.pontos[m] ? co.pontos[m].media : null),
+          borderColor: cor, backgroundColor: cor, borderWidth:2, tension:.28, spanGaps:false,
+          pointRadius:0, pointHoverRadius:4, pointBackgroundColor:cor, pointBorderColor:surf, pointBorderWidth:2
+        };
+      })},
+    options:{...opt,
+      plugins:{...opt.plugins,
+        legend:{display:true, position:"top", align:"end", labels:{color:cssVar("--ink-2"), boxWidth:9, boxHeight:9, usePointStyle:true, font:{family:"Karla",size:12}}},
+        tooltip:{...opt.plugins.tooltip, callbacks:{
+          label: c => c.dataset.label + ": " + fmtR$.format(c.parsed.y) + " · " + fmtN.format(LTV.coortes[c.datasetIndex].pontos[c.dataIndex].base) + " clientes" }}},
+      scales:{...opt.scales, y:{...opt.scales.y, ticks:{...opt.scales.y.ticks, callback: v => fmtR$0.format(v)}}}}
+  });
+
+  // 6.9 Distribuição das clientes por faixa de gasto acumulado
+  const totalFat = LTV.faixas.reduce((s,f) => s+f.fat, 0) || 1;
+  graficos.ltvFaixa = new Chart(el("ch-ltv-faixa"), {
+    type:"bar",
+    data:{ labels: LTV.faixas.map(f => f.rot),
+      datasets:[{ data: LTV.faixas.map(f => f.n), backgroundColor:s1, borderRadius:4, borderSkipped:false }]},
+    options:{...opt, plugins:{...opt.plugins, tooltip:{...opt.plugins.tooltip, callbacks:{
+        label: c => [fmtN.format(c.parsed.y) + " clientes",
+                     fmtR$0.format(LTV.faixas[c.dataIndex].fat) + " · " + pct(LTV.faixas[c.dataIndex].fat/totalFat) + " do faturamento"] }}},
+      scales:{...opt.scales, y:{...opt.scales.y, ticks:{...opt.scales.y.ticks, callback: v => fmtN.format(v)}}}}
+  });
 }
 
 /* =========================================================================
@@ -808,7 +976,8 @@ function render(){
     tile("Ticket médio", fmtR$.format(met.ticket), "por procedimento realizado") +
     tile("Clientes únicas", fmtN.format(met.unicos), "nomes distintos") +
     tile("Novas clientes", pct(met.novosPct), "das respostas “primeira vez”") +
-    tile("Taxa de retorno", pct(met.retornoPct), "clientes com 2+ atendimentos");
+    tile("Taxa de retorno", pct(met.retornoPct), "clientes com 2+ atendimentos") +
+    tile("LTV médio", LTV ? fmtR$.format(LTV.medio) : "–", "gasto acumulado por cliente · base inteira");
 
   // --- tráfego: só os meses em que as duas fontes existem ---
   const porMes = new Map(serie);
@@ -837,6 +1006,19 @@ function render(){
     tile("Faturamento de anúncio", fmtR$0.format(fatAd), "clientes que vieram de anúncio") +
     tile("ROAS de anúncio", inv ? (fatAd/inv).toFixed(2).replace(".",",") + "×" : "–", inv ? `referência sobre o total: ${(fatTotalNosMeses/inv).toFixed(1).replace(".",",")}×` : "") +
     tile("CAC", novosAd ? fmtR$.format(inv/novosAd) : "–", `${fmtN.format(novosAd)} novas clientes de anúncio`);
+
+  // --- LTV: sempre a base inteira, por isso não usa `dados` nem `met` ---
+  if (LTV){
+    const a = LTV.anuncio;
+    el("kpis-ltv").innerHTML =
+      tile("LTV médio", fmtR$.format(LTV.medio), `${fmtN.format(LTV.clientes)} clientes desde ${LTV.inicio.toLocaleDateString("pt-BR")}`) +
+      tile("LTV de quem volta", fmtR$.format(LTV.medioRec), `média das ${fmtN.format(LTV.recorrentes)} clientes com 2+ atendimentos`) +
+      tile("LTV em 12 meses", isFinite(LTV.ltv12) ? fmtR$.format(LTV.ltv12) : "–", `primeiro ano das ${fmtN.format(LTV.maduros)} clientes com um ano de casa`) +
+      tile("Vida média", isFinite(LTV.vidaRec) ? LTV.vidaRec.toFixed(1).replace(".",",") + " meses" : "–", "entre a 1ª e a última visita de quem volta") +
+      tile("LTV de anúncio", isFinite(a.ltv) ? fmtR$.format(a.ltv) : "–", a.n ? `${fmtN.format(a.n)} clientes conquistadas desde ${rotuloMes(a.mesIni)}` : "sem clientes de anúncio na base") +
+      tile("ROAS de LTV", isFinite(a.roas) ? a.roas.toFixed(2).replace(".",",") + "×" : "–", isFinite(a.cac) ? `por real investido, ao longo da vida · CAC ${fmtR$.format(a.cac)}` : "");
+    el("hint-ltv").textContent = `Base inteira, sem os filtros acima — o histórico de cada cliente não é cortado por período`;
+  }
 
   el("hint-trafego").textContent = trafegoMes.length
     ? `Meta Ads tem histórico a partir de set/2023 — os cruzamentos usam só os meses com as duas fontes`
@@ -878,6 +1060,17 @@ function insights(dados, met, serie, tr){
   if (tr.inv) itens.push(["07", `Cada conversa aberta por anúncio custou <b>${tr.conv ? fmtR$.format(tr.inv/tr.conv) : "–"}</b>; cada nova cliente vinda de anúncio custou <b>${tr.novosAd ? fmtR$.format(tr.inv/tr.novosAd) : "–"}</b>.`]);
   if (tr.inv) itens.push(["08", `O faturamento declarado como vindo de anúncio devolveu <b>${(tr.fatAd/tr.inv).toFixed(2).replace(".",",")}×</b> o investido nos meses comparáveis.`]);
 
+  if (LTV){
+    const a = LTV.anuncio;
+    itens.push(["09", `Cada cliente deixa <b>${fmtR$.format(LTV.medio)}</b> ao longo da vida; quem volta ao menos uma vez deixa <b>${fmtR$.format(LTV.medioRec)}</b> — ${isFinite(LTV.medioRec/LTV.medio) ? (LTV.medioRec/LTV.medio).toFixed(1).replace(".",",") + "×" : "–"} mais.`]);
+    const co = LTV.coortes;
+    if (co.length >= 2){
+      const velha = co[0], nova = co[co.length-1];
+      itens.push(["10", `Cliente nova vale mais que cliente antiga: quem chegou em <b>${nova.ano}</b> já acumula ${fmtR$.format(nova.total)}, contra ${fmtR$.format(velha.total)} de quem chegou em ${velha.ano} — o ticket subiu, não só o volume.`]);
+    }
+    if (isFinite(a.roas)) itens.push(["11", `Contando a vida inteira das clientes vindas de anúncio, cada real investido devolveu <b>${a.roas.toFixed(2).replace(".",",")}×</b> — custou ${fmtR$.format(a.cac)} conquistar cada uma, que depois gastou ${fmtR$.format(a.ltv)}.`]);
+  }
+
   el("insights").innerHTML = itens.map(([n,t]) => `<div class="ins"><span class="mark">${n}</span><p>${t}</p></div>`).join("");
 
   const partAnuncio = met.fat ? tr.fatAd/met.fat : 0;
@@ -885,7 +1078,10 @@ function insights(dados, met, serie, tr){
     `<b>Em uma frase:</b> o studio faturou ${fmtR$0.format(met.fat)} em ${fmtN.format(met.atendimentos)} atendimentos de ${fmtN.format(met.unicos)} clientes, ` +
     `com ticket médio de ${fmtR$.format(met.ticket)}. A operação se sustenta em base recorrente — ${pct(met.retornoPct)} das clientes voltam e ` +
     `${topOrig ? pct(topOrig[1]/nAt) + " chegam por " + topOrig[0].toLowerCase() : ""} — enquanto o tráfego pago responde por ${pct(partAnuncio)} do faturamento do período. ` +
-    `Anúncio é o motor de entrada de gente nova, não o de faturamento: leia o ROAS de anúncio, não o total.`;
+    `Anúncio é o motor de entrada de gente nova, não o de faturamento: leia o ROAS de anúncio, não o total — ` +
+    (LTV && isFinite(LTV.anuncio.roas)
+      ? `e, olhando a vida inteira da cliente conquistada por anúncio, cada real investido volta ${LTV.anuncio.roas.toFixed(2).replace(".",",")}×.`
+      : `o retorno completo aparece no bloco de LTV.`);
 }
 
 /* =========================================================================
